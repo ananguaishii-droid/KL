@@ -1,0 +1,1537 @@
+--[[
+    PROCYSIS HUB  ::  Blox Fruits
+    BY.PROCYSIS
+
+    Tabs:  Farm | Misc | Stats | Info
+    Features:
+      - Auto Farm (closest mob, hover + attack), mob name filter, weapon cycle
+      - Safety Retreat (hover away when HP is low, resume when healed)
+      - Fruit Collector + Fruit ESP
+      - Auto Stats (CommF_ AddPoint), Team select (CommF_ SetTeam)
+      - Low-Lag Mode (reversible), Anti-AFK, FPS / Ping readout
+      - Draggable touch-friendly GUI, minimize to logo, RightControl to hide
+      - Sea detection (First / Second / Third Sea)
+
+    Remote names (CommF_ / AddPoint / SetTeam) can change when the game updates.
+    Every remote call is wrapped in pcall, so a changed name will not crash the hub.
+    Re-executing the script cleanly destroys the previous instance.
+]]
+
+local env = (getgenv and getgenv()) or _G
+if env.PROCYSIS_BF then
+    pcall(function() env.PROCYSIS_BF.Destroy() end)
+end
+
+---------------------------------------------------------------------
+-- Services (lazy)
+---------------------------------------------------------------------
+local Services = setmetatable({}, {
+    __index = function(t, k)
+        local s = game:GetService(k)
+        rawset(t, k, s)
+        return s
+    end,
+})
+
+local Players           = Services.Players
+local RunService        = Services.RunService
+local TweenService      = Services.TweenService
+local UserInputService  = Services.UserInputService
+local VirtualUser       = Services.VirtualUser
+local Lighting          = Services.Lighting
+local ReplicatedStorage = Services.ReplicatedStorage
+
+local Player = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- Brand / Game info
+---------------------------------------------------------------------
+local BRAND = {
+    Name    = "PROCYSIS HUB",
+    Credit  = "BY.PROCYSIS",
+    Version = "2.0.0",
+}
+
+local SEAS = {
+    [2753915549] = 1, -- First Sea
+    [4442272183] = 2, -- Second Sea
+    [7449423635] = 3, -- Third Sea
+}
+local SEA_NAMES = { "First Sea", "Second Sea", "Third Sea" }
+local Sea = SEAS[game.PlaceId]
+local SeaLabel = Sea and SEA_NAMES[Sea] or "Unknown place"
+
+---------------------------------------------------------------------
+-- Config
+---------------------------------------------------------------------
+local CONFIG = {
+    FarmHeight      = 12,
+    TweenSpeed      = 250,
+    CloseRange      = 60,
+    AttackInterval  = 0.12,
+    TargetRange     = 3000,
+    EnemyFolders    = { "Enemies" },
+    EnemyNameFilter = {},
+    WeaponTypes     = { "Melee", "Sword", "Gun", "Blox Fruit" },
+    WeaponIndex     = 1,
+    FruitScanRate   = 2.0,
+    FruitRange      = 2500,
+    SafetyLow       = 0.35,
+    SafetyHigh      = 0.80,
+    SafetyHeight    = 90,
+    LowLagFpsCap    = 60,
+    StatNames       = { "Melee", "Defense", "Sword", "Gun", "Demon Fruit" },
+    StatIndex       = 1,
+    StatPointsPer   = 1,
+    HideKey         = Enum.KeyCode.RightControl,
+}
+
+---------------------------------------------------------------------
+-- Maid
+---------------------------------------------------------------------
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+    return setmetatable({ _tasks = {} }, Maid)
+end
+
+function Maid:Give(item)
+    table.insert(self._tasks, item)
+    return item
+end
+
+function Maid:Clean()
+    for i = #self._tasks, 1, -1 do
+        local item = self._tasks[i]
+        local kind = typeof(item)
+        if kind == "RBXScriptConnection" then
+            item:Disconnect()
+        elseif kind == "Instance" then
+            item:Destroy()
+        elseif kind == "function" then
+            pcall(item)
+        elseif kind == "thread" then
+            pcall(task.cancel, item)
+        end
+        self._tasks[i] = nil
+    end
+end
+
+local maid = Maid.new()
+local alive = true
+
+---------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------
+local State = {
+    AutoFarm   = false,
+    AutoFruit  = false,
+    FruitESP   = false,
+    AutoStats  = false,
+    LowLag     = false,
+    Safety     = true,
+    Kills      = 0,
+    FruitsGot  = 0,
+    Target     = nil,
+    Retreating = false,
+    Status     = "Idle",
+    Started    = os.clock(),
+    FPS        = 0,
+    Ping       = 0,
+}
+
+---------------------------------------------------------------------
+-- Util
+---------------------------------------------------------------------
+local function getRoot()
+    local c = Player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+    local c = Player.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function isAlive(model)
+    if not model or not model.Parent then return false end
+    local h = model:FindFirstChildOfClass("Humanoid")
+    return h ~= nil and h.Health > 0
+end
+
+local function safe(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        warn("[PROCYSIS] " .. tostring(err))
+    end
+    return ok, err
+end
+
+local function formatTime(seconds)
+    seconds = math.floor(seconds)
+    return string.format("%02d:%02d:%02d", seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+end
+
+local function healthFraction()
+    local hum = getHumanoid()
+    if not hum or hum.MaxHealth <= 0 then return 1 end
+    return hum.Health / hum.MaxHealth
+end
+
+local function trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+---------------------------------------------------------------------
+-- Theme + UI primitives (created early so Notify is available to modules)
+---------------------------------------------------------------------
+local THEME = {
+    Bg      = Color3.fromRGB(14, 14, 20),
+    Panel   = Color3.fromRGB(26, 26, 36),
+    Panel2  = Color3.fromRGB(34, 34, 48),
+    AccentA = Color3.fromRGB(139, 92, 246),
+    AccentB = Color3.fromRGB(34, 211, 238),
+    Off     = Color3.fromRGB(58, 58, 76),
+    Text    = Color3.fromRGB(240, 240, 250),
+    SubText = Color3.fromRGB(150, 150, 172),
+    Danger  = Color3.fromRGB(239, 68, 68),
+}
+
+local function create(class, props, children)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        inst[k] = v
+    end
+    for _, child in ipairs(children or {}) do
+        child.Parent = inst
+    end
+    return inst
+end
+
+local function corner(r)
+    return create("UICorner", { CornerRadius = UDim.new(0, r or 8) })
+end
+
+local function gradient(rotation)
+    return create("UIGradient", {
+        Color = ColorSequence.new(THEME.AccentA, THEME.AccentB),
+        Rotation = rotation or 0,
+    })
+end
+
+local function guiParent()
+    local ok, ui = pcall(function()
+        return (gethui and gethui()) or Services.CoreGui
+    end)
+    if ok and ui then return ui end
+    return Player:WaitForChild("PlayerGui")
+end
+
+local screenGui = maid:Give(create("ScreenGui", {
+    Name = "PROCYSIS_BF",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}))
+screenGui.Parent = guiParent()
+
+local notifHolder = create("Frame", {
+    Name = "Notifications",
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -10, 0, 10),
+    Size = UDim2.fromOffset(230, 300),
+    BackgroundTransparency = 1,
+    ZIndex = 50,
+    Parent = screenGui,
+}, {
+    create("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    }),
+})
+
+local function Notify(text, duration)
+    duration = duration or 3
+    if not alive then return end
+    local card = create("Frame", {
+        Size = UDim2.fromOffset(220, 36),
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 1,
+        ZIndex = 51,
+        Parent = notifHolder,
+    }, { corner(8) })
+    local bar = create("Frame", {
+        Size = UDim2.new(0, 3, 1, -10),
+        Position = UDim2.fromOffset(6, 5),
+        BackgroundColor3 = THEME.AccentB,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 52,
+        Parent = card,
+    }, { corner(2) })
+    local lbl = create("TextLabel", {
+        Size = UDim2.new(1, -22, 1, 0),
+        Position = UDim2.fromOffset(16, 0),
+        BackgroundTransparency = 1,
+        TextTransparency = 1,
+        Text = text,
+        TextColor3 = THEME.Text,
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 52,
+        Parent = card,
+    })
+    local info = TweenInfo.new(0.2)
+    TweenService:Create(card, info, { BackgroundTransparency = 0.05 }):Play()
+    TweenService:Create(bar, info, { BackgroundTransparency = 0 }):Play()
+    TweenService:Create(lbl, info, { TextTransparency = 0 }):Play()
+    task.delay(duration, function()
+        if not card.Parent then return end
+        TweenService:Create(card, info, { BackgroundTransparency = 1 }):Play()
+        TweenService:Create(bar, info, { BackgroundTransparency = 1 }):Play()
+        local t = TweenService:Create(lbl, info, { TextTransparency = 1 })
+        t:Play()
+        t.Completed:Wait()
+        if card.Parent then card:Destroy() end
+    end)
+end
+
+---------------------------------------------------------------------
+-- Mover
+---------------------------------------------------------------------
+local Mover = {}
+local activeTween
+
+function Mover.Hold()
+    local root = getRoot()
+    if not root then return end
+    local bv = root:FindFirstChild("PROCYSIS_Hold")
+    if not bv then
+        bv = Instance.new("BodyVelocity")
+        bv.Name = "PROCYSIS_Hold"
+        bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        bv.Velocity = Vector3.zero
+        bv.Parent = root
+    end
+end
+
+function Mover.Release()
+    local root = getRoot()
+    if root then
+        local bv = root:FindFirstChild("PROCYSIS_Hold")
+        if bv then bv:Destroy() end
+    end
+end
+
+function Mover.CancelTween()
+    if activeTween then
+        activeTween:Cancel()
+        activeTween = nil
+    end
+end
+
+function Mover.GoTo(goal)
+    local root = getRoot()
+    if not root then return end
+    local dist = (root.Position - goal.Position).Magnitude
+    if dist <= CONFIG.CloseRange then
+        Mover.CancelTween()
+        root.CFrame = goal
+        return
+    end
+    if activeTween and activeTween.PlaybackState == Enum.PlaybackState.Playing then
+        return
+    end
+    activeTween = TweenService:Create(
+        root,
+        TweenInfo.new(dist / CONFIG.TweenSpeed, Enum.EasingStyle.Linear),
+        { CFrame = goal }
+    )
+    activeTween:Play()
+end
+
+maid:Give(RunService.Stepped:Connect(function()
+    if not (State.AutoFarm or State.AutoFruit) then return end
+    local char = Player.Character
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            part.CanCollide = false
+        end
+    end
+end))
+
+---------------------------------------------------------------------
+-- Combat
+---------------------------------------------------------------------
+local Combat = {}
+
+function Combat.EquipWeapon()
+    local char, hum = Player.Character, getHumanoid()
+    if not (char and hum) then return nil end
+    local wanted = CONFIG.WeaponTypes[CONFIG.WeaponIndex]
+
+    local held = char:FindFirstChildOfClass("Tool")
+    if held and held.ToolTip == wanted then return held end
+
+    for _, tool in ipairs(Player.Backpack:GetChildren()) do
+        if tool:IsA("Tool") and tool.ToolTip == wanted then
+            hum:EquipTool(tool)
+            return tool
+        end
+    end
+    return held
+end
+
+function Combat.Attack()
+    local tool = Combat.EquipWeapon()
+    if tool then
+        safe(function() tool:Activate() end)
+    end
+    safe(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(1280, 672))
+        VirtualUser:Button1Up(Vector2.new(1280, 672))
+    end)
+end
+
+---------------------------------------------------------------------
+-- Enemies
+---------------------------------------------------------------------
+local Enemies = {}
+local trackedDeaths = setmetatable({}, { __mode = "k" })
+
+local function matchesFilter(name)
+    local filter = CONFIG.EnemyNameFilter
+    if #filter == 0 then return true end
+    local lowered = string.lower(name)
+    for _, needle in ipairs(filter) do
+        if string.find(lowered, string.lower(needle), 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function Enemies.GetClosest()
+    local root = getRoot()
+    if not root then return nil end
+    local best, bestDist = nil, CONFIG.TargetRange
+    for _, folderName in ipairs(CONFIG.EnemyFolders) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder then
+            for _, mob in ipairs(folder:GetChildren()) do
+                if mob:IsA("Model") and isAlive(mob) and matchesFilter(mob.Name) then
+                    local mr = mob:FindFirstChild("HumanoidRootPart")
+                    if mr then
+                        local d = (mr.Position - root.Position).Magnitude
+                        if d < bestDist then
+                            best, bestDist = mob, d
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Enemies.TrackKill(mob)
+    if trackedDeaths[mob] then return end
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    trackedDeaths[mob] = true
+    hum.Died:Once(function()
+        State.Kills += 1
+    end)
+end
+
+---------------------------------------------------------------------
+-- Safety
+---------------------------------------------------------------------
+local retreatAnchor
+
+local function handleSafety()
+    if not State.Safety then
+        State.Retreating = false
+        retreatAnchor = nil
+        return false
+    end
+    local frac = healthFraction()
+    if State.Retreating then
+        if frac >= CONFIG.SafetyHigh then
+            State.Retreating = false
+            retreatAnchor = nil
+            Notify("HP recovered, resuming", 2)
+        end
+    elseif frac <= CONFIG.SafetyLow then
+        State.Retreating = true
+        local root = getRoot()
+        if root then
+            retreatAnchor = root.Position + Vector3.new(0, CONFIG.SafetyHeight, 0)
+        end
+        Notify("Low HP, retreating", 2)
+    end
+
+    if State.Retreating then
+        State.Status = "Recovering (safe hover)"
+        local root = getRoot()
+        if root and retreatAnchor then
+            Mover.Hold()
+            Mover.CancelTween()
+            root.CFrame = CFrame.new(retreatAnchor)
+        end
+        return true
+    end
+    return false
+end
+
+---------------------------------------------------------------------
+-- Farm loop
+---------------------------------------------------------------------
+local function farmLoop()
+    while alive do
+        if not State.AutoFarm then
+            State.Target = nil
+            task.wait(0.25)
+        else
+            local ok, err = pcall(function()
+                if not (getRoot() and isAlive(Player.Character)) then
+                    State.Status = "Waiting for respawn"
+                    task.wait(0.5)
+                    return
+                end
+
+                if handleSafety() then
+                    task.wait(0.25)
+                    return
+                end
+
+                local enemy = Enemies.GetClosest()
+                if not enemy then
+                    State.Target = nil
+                    State.Status = "Searching for enemies"
+                    Mover.Release()
+                    task.wait(0.5)
+                    return
+                end
+
+                State.Target = enemy
+                Enemies.TrackKill(enemy)
+                Mover.Hold()
+
+                local lastAttack = 0
+                while alive and State.AutoFarm and isAlive(enemy) do
+                    local root, eroot = getRoot(), enemy:FindFirstChild("HumanoidRootPart")
+                    if not (root and eroot) then break end
+                    if State.Safety and healthFraction() <= CONFIG.SafetyLow then break end
+
+                    local hoverPos = eroot.Position + Vector3.new(0, CONFIG.FarmHeight, 0)
+                    Mover.GoTo(CFrame.lookAt(hoverPos, eroot.Position))
+                    State.Status = "Farming: " .. enemy.Name
+
+                    local now = os.clock()
+                    if now - lastAttack >= CONFIG.AttackInterval then
+                        lastAttack = now
+                        Combat.Attack()
+                    end
+                    task.wait()
+                end
+                Mover.CancelTween()
+            end)
+            if not ok then
+                warn("[PROCYSIS] farm error: " .. tostring(err))
+                task.wait(0.5)
+            end
+        end
+    end
+end
+
+---------------------------------------------------------------------
+-- Fruit collector + ESP
+---------------------------------------------------------------------
+local FruitCollector = {}
+
+local function findFruitHandle(inst)
+    local lowered = string.lower(inst.Name)
+    if not string.find(lowered, "fruit", 1, true) then return nil end
+    if inst:IsA("Tool") then
+        return inst:FindFirstChild("Handle")
+    elseif inst:IsA("Model") then
+        return inst:FindFirstChild("Handle") or inst.PrimaryPart
+    end
+    return nil
+end
+
+function FruitCollector.FindNearest()
+    local root = getRoot()
+    if not root then return nil end
+    local best, bestDist = nil, CONFIG.FruitRange
+    for _, inst in ipairs(workspace:GetChildren()) do
+        local handle = findFruitHandle(inst)
+        if handle then
+            local d = (handle.Position - root.Position).Magnitude
+            if d < bestDist then
+                best, bestDist = handle, d
+            end
+        end
+    end
+    return best
+end
+
+local function fruitLoop()
+    while alive do
+        if not State.AutoFruit then
+            task.wait(0.5)
+        else
+            local ok, err = pcall(function()
+                local handle = FruitCollector.FindNearest()
+                local root = getRoot()
+                if not (handle and root) then return end
+
+                State.Status = "Collecting fruit"
+                Notify("Fruit found: " .. (handle.Parent and handle.Parent.Name or "?"), 2)
+                Mover.Hold()
+                local deadline = os.clock() + 25
+                while alive and State.AutoFruit and handle.Parent and os.clock() < deadline do
+                    root = getRoot()
+                    if not root then break end
+                    Mover.GoTo(handle.CFrame)
+                    if (root.Position - handle.Position).Magnitude < 8 then
+                        if firetouchinterest then
+                            firetouchinterest(root, handle, 0)
+                            firetouchinterest(root, handle, 1)
+                        end
+                        State.FruitsGot += 1
+                        break
+                    end
+                    task.wait()
+                end
+                Mover.CancelTween()
+            end)
+            if not ok then
+                warn("[PROCYSIS] fruit error: " .. tostring(err))
+            end
+            task.wait(CONFIG.FruitScanRate)
+        end
+    end
+end
+
+local espObjects = {}
+
+local function clearESP()
+    for handle, gui in pairs(espObjects) do
+        if gui then gui:Destroy() end
+        espObjects[handle] = nil
+    end
+end
+
+local function espLoop()
+    while alive do
+        if not State.FruitESP then
+            if next(espObjects) then clearESP() end
+            task.wait(0.5)
+        else
+            safe(function()
+                local root = getRoot()
+                local seen = {}
+                for _, inst in ipairs(workspace:GetChildren()) do
+                    local handle = findFruitHandle(inst)
+                    if handle then
+                        seen[handle] = true
+                        local gui = espObjects[handle]
+                        if not gui then
+                            gui = create("BillboardGui", {
+                                Name = "PROCYSIS_ESP",
+                                Adornee = handle,
+                                AlwaysOnTop = true,
+                                Size = UDim2.fromOffset(140, 36),
+                                StudsOffset = Vector3.new(0, 3, 0),
+                            }, {
+                                create("TextLabel", {
+                                    Name = "Label",
+                                    Size = UDim2.fromScale(1, 1),
+                                    BackgroundTransparency = 1,
+                                    TextColor3 = THEME.AccentB,
+                                    TextStrokeTransparency = 0.4,
+                                    TextSize = 13,
+                                    Font = Enum.Font.GothamBold,
+                                }),
+                            })
+                            gui.Parent = screenGui
+                            espObjects[handle] = gui
+                        end
+                        local dist = root and math.floor((root.Position - handle.Position).Magnitude) or 0
+                        gui.Label.Text = inst.Name .. "\n[" .. dist .. "m]"
+                    end
+                end
+                for handle, gui in pairs(espObjects) do
+                    if not seen[handle] or not handle.Parent then
+                        gui:Destroy()
+                        espObjects[handle] = nil
+                    end
+                end
+            end)
+            task.wait(0.5)
+        end
+    end
+end
+
+---------------------------------------------------------------------
+-- Game remotes (Blox Fruits): stats + team
+---------------------------------------------------------------------
+local Remotes = {}
+
+local function getCommF()
+    local folder = ReplicatedStorage:FindFirstChild("Remotes")
+    return folder and folder:FindFirstChild("CommF_")
+end
+
+function Remotes.AddPoint(stat, amount)
+    local commF = getCommF()
+    if not commF then return false, "CommF_ not found" end
+    return pcall(function()
+        return commF:InvokeServer("AddPoint", stat, amount)
+    end)
+end
+
+function Remotes.SetTeam(team)
+    local commF = getCommF()
+    if not commF then
+        Notify("CommF_ remote not found", 3)
+        return false
+    end
+    local ok = pcall(function()
+        commF:InvokeServer("SetTeam", team)
+    end)
+    Notify(ok and ("Team request sent: " .. team) or "Team request failed", 3)
+    return ok
+end
+
+local function statsLoop()
+    while alive do
+        if State.AutoStats then
+            Remotes.AddPoint(CONFIG.StatNames[CONFIG.StatIndex], CONFIG.StatPointsPer)
+            task.wait(1.5)
+        else
+            task.wait(0.5)
+        end
+    end
+end
+
+---------------------------------------------------------------------
+-- Low-Lag mode
+---------------------------------------------------------------------
+local LowLag = {}
+local originals = setmetatable({}, { __mode = "k" })
+local lagConnection
+local originalLighting
+
+local function strip(inst)
+    if originals[inst] then return end
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+        or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
+        originals[inst] = { "Enabled", inst.Enabled }
+        inst.Enabled = false
+    elseif inst:IsA("Decal") or inst:IsA("Texture") then
+        originals[inst] = { "Transparency", inst.Transparency }
+        inst.Transparency = 1
+    elseif inst:IsA("BasePart") then
+        originals[inst] = { "Material", inst.Material }
+        inst.Material = Enum.Material.SmoothPlastic
+        inst.CastShadow = false
+    end
+end
+
+function LowLag.Enable()
+    if lagConnection then return end
+    originalLighting = {
+        GlobalShadows = Lighting.GlobalShadows,
+        FogEnd = Lighting.FogEnd,
+    }
+    safe(function() Lighting.GlobalShadows = false end)
+    safe(function() Lighting.FogEnd = 9e9 end)
+    safe(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+    if setfpscap then safe(setfpscap, CONFIG.LowLagFpsCap) end
+
+    task.spawn(function()
+        local count = 0
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if not State.LowLag then return end
+            strip(inst)
+            count += 1
+            if count % 400 == 0 then task.wait() end
+        end
+    end)
+
+    lagConnection = workspace.DescendantAdded:Connect(function(inst)
+        if State.LowLag then strip(inst) end
+    end)
+end
+
+function LowLag.Disable()
+    if lagConnection then
+        lagConnection:Disconnect()
+        lagConnection = nil
+    end
+    for inst, record in pairs(originals) do
+        if inst.Parent then
+            safe(function() inst[record[1]] = record[2] end)
+        end
+        originals[inst] = nil
+    end
+    if originalLighting then
+        safe(function() Lighting.GlobalShadows = originalLighting.GlobalShadows end)
+        safe(function() Lighting.FogEnd = originalLighting.FogEnd end)
+    end
+end
+
+---------------------------------------------------------------------
+-- Anti-AFK + respawn handling + perf counters
+---------------------------------------------------------------------
+maid:Give(Player.Idled:Connect(function()
+    safe(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end))
+
+maid:Give(Player.CharacterAdded:Connect(function()
+    task.wait(1)
+    State.Retreating = false
+    retreatAnchor = nil
+    if State.AutoFarm or State.AutoFruit then
+        Mover.Hold()
+    end
+end))
+
+do
+    local frames, last = 0, os.clock()
+    maid:Give(RunService.RenderStepped:Connect(function()
+        frames += 1
+        local now = os.clock()
+        if now - last >= 1 then
+            State.FPS = frames
+            frames, last = 0, now
+            safe(function()
+                State.Ping = math.floor(Services.Stats.Network.ServerStatsItem["Data Ping"]:GetValue())
+            end)
+        end
+    end))
+end
+
+---------------------------------------------------------------------
+-- UI :: window
+---------------------------------------------------------------------
+local WIN_W, WIN_H = 300, 400
+
+local main = create("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(WIN_W, WIN_H),
+    Position = UDim2.new(0, 16, 0.5, -WIN_H / 2),
+    BackgroundColor3 = THEME.Bg,
+    BorderSizePixel = 0,
+    Visible = false,
+    Parent = screenGui,
+}, {
+    corner(12),
+    create("UIStroke", { Color = THEME.AccentA, Thickness = 1.4, Transparency = 0.35 }),
+})
+
+local header = create("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 46),
+    BackgroundColor3 = THEME.Panel,
+    BorderSizePixel = 0,
+    Parent = main,
+}, { corner(12) })
+
+create("Frame", { -- square off header bottom corners
+    Size = UDim2.new(1, 0, 0, 12),
+    Position = UDim2.new(0, 0, 1, -12),
+    BackgroundColor3 = THEME.Panel,
+    BorderSizePixel = 0,
+    Parent = header,
+})
+
+local accentLine = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 2),
+    Position = UDim2.new(0, 0, 1, -2),
+    BorderSizePixel = 0,
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    Parent = header,
+}, { gradient(0) })
+
+create("TextLabel", {
+    Size = UDim2.new(1, -90, 0, 22),
+    Position = UDim2.fromOffset(12, 5),
+    BackgroundTransparency = 1,
+    Text = BRAND.Name,
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 16,
+    Font = Enum.Font.GothamBlack,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = header,
+}, { gradient(0) })
+
+create("TextLabel", {
+    Size = UDim2.new(1, -90, 0, 14),
+    Position = UDim2.fromOffset(12, 26),
+    BackgroundTransparency = 1,
+    Text = "Blox Fruits  |  " .. SeaLabel .. "  |  " .. BRAND.Credit,
+    TextColor3 = THEME.SubText,
+    TextSize = 11,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = header,
+})
+
+local function headerButton(text, offset)
+    return create("TextButton", {
+        Size = UDim2.fromOffset(26, 24),
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, offset, 0.5, 0),
+        BackgroundColor3 = THEME.Off,
+        Text = text,
+        TextColor3 = THEME.Text,
+        TextSize = 14,
+        Font = Enum.Font.GothamBold,
+        Parent = header,
+    }, { corner(6) })
+end
+
+local minimizeBtn = headerButton("-", -42)
+local closeBtn    = headerButton("X", -10)
+closeBtn.BackgroundColor3 = THEME.Danger
+
+-- Tab bar
+local TAB_NAMES = { "Farm", "Misc", "Stats", "Info" }
+
+local tabBar = create("Frame", {
+    Size = UDim2.new(1, -16, 0, 28),
+    Position = UDim2.fromOffset(8, 52),
+    BackgroundTransparency = 1,
+    Parent = main,
+})
+
+local content = create("Frame", {
+    Size = UDim2.new(1, -16, 1, -128),
+    Position = UDim2.fromOffset(8, 86),
+    BackgroundTransparency = 1,
+    ClipsDescendants = true,
+    Parent = main,
+})
+
+-- Footer
+local footer = create("Frame", {
+    Size = UDim2.new(1, -16, 0, 28),
+    Position = UDim2.new(0, 8, 1, -34),
+    BackgroundColor3 = THEME.Panel,
+    BorderSizePixel = 0,
+    Parent = main,
+}, { corner(8) })
+
+create("TextLabel", {
+    Size = UDim2.new(0.5, 0, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = BRAND.Credit,
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 12,
+    Font = Enum.Font.GothamBlack,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = footer,
+}, { gradient(0) })
+
+local perfLabel = create("TextLabel", {
+    Size = UDim2.new(0.5, -10, 1, 0),
+    Position = UDim2.new(0.5, 0, 0, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = THEME.SubText,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    Parent = footer,
+})
+
+local pages, tabButtons = {}, {}
+local currentTab
+
+local function selectTab(name)
+    currentTab = name
+    for tabName, page in pairs(pages) do
+        page.Visible = (tabName == name)
+    end
+    for tabName, btn in pairs(tabButtons) do
+        local active = tabName == name
+        btn.BackgroundColor3 = active and THEME.AccentA or THEME.Panel
+        btn.TextColor3 = active and Color3.new(1, 1, 1) or THEME.SubText
+    end
+end
+
+for i, name in ipairs(TAB_NAMES) do
+    local width = 1 / #TAB_NAMES
+    local btn = create("TextButton", {
+        Size = UDim2.new(width, -4, 1, 0),
+        Position = UDim2.new(width * (i - 1), 2, 0, 0),
+        BackgroundColor3 = THEME.Panel,
+        Text = name,
+        TextColor3 = THEME.SubText,
+        TextSize = 12,
+        Font = Enum.Font.GothamBold,
+        Parent = tabBar,
+    }, { corner(7) })
+    tabButtons[name] = btn
+
+    pages[name] = create("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = THEME.AccentA,
+        CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+        Parent = content,
+    }, {
+        create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+        create("UIPadding", { PaddingRight = UDim.new(0, 6) }),
+    })
+
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+end
+
+---------------------------------------------------------------------
+-- UI :: components
+---------------------------------------------------------------------
+local order = 0
+local function nextOrder()
+    order += 1
+    return order
+end
+
+local function addSection(page, text)
+    create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Text = string.upper(text),
+        TextColor3 = THEME.AccentB,
+        TextSize = 11,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    })
+end
+
+local function addToggle(page, label, initial, callback)
+    local state = initial
+    local row = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = THEME.Panel,
+        Text = "",
+        AutoButtonColor = false,
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, { corner(8) })
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -60, 1, 0),
+        Position = UDim2.fromOffset(10, 0),
+        BackgroundTransparency = 1,
+        Text = label,
+        TextColor3 = THEME.Text,
+        TextSize = 13,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+
+    local pill = create("Frame", {
+        Size = UDim2.fromOffset(38, 18),
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        BackgroundColor3 = state and THEME.AccentA or THEME.Off,
+        Parent = row,
+    }, { corner(9) })
+
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = state and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        Parent = pill,
+    }, { corner(7) })
+
+    row.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(pill, TweenInfo.new(0.15), {
+            BackgroundColor3 = state and THEME.AccentA or THEME.Off,
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15), {
+            Position = state and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        }):Play()
+        safe(callback, state)
+    end)
+end
+
+local function addButton(page, label, callback)
+    local btn = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = THEME.Panel2,
+        Text = label,
+        TextColor3 = THEME.Text,
+        TextSize = 13,
+        Font = Enum.Font.GothamMedium,
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, { corner(8) })
+    btn.MouseButton1Click:Connect(function()
+        safe(callback, btn)
+    end)
+    return btn
+end
+
+local function addCycle(page, prefix, options, getIndex, setIndex)
+    local btn
+    btn = addButton(page, prefix .. options[getIndex()], function()
+        local i = (getIndex() % #options) + 1
+        setIndex(i)
+        btn.Text = prefix .. options[i]
+    end)
+    return btn
+end
+
+local function addSlider(page, label, min, max, default, step, callback)
+    local value = default
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 50),
+        BackgroundColor3 = THEME.Panel,
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, { corner(8) })
+
+    local title = create("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 20),
+        Position = UDim2.fromOffset(10, 4),
+        BackgroundTransparency = 1,
+        Text = label .. ": " .. tostring(value),
+        TextColor3 = THEME.Text,
+        TextSize = 12,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+
+    local hit = create("TextButton", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.fromOffset(10, 24),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        Parent = row,
+    })
+
+    local bar = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 6),
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = THEME.Off,
+        BorderSizePixel = 0,
+        Parent = hit,
+    }, { corner(3) })
+
+    local fill = create("Frame", {
+        Size = UDim2.fromScale((value - min) / (max - min), 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Parent = bar,
+    }, { corner(3), gradient(0) })
+
+    local dragging = false
+    local function setFromX(x)
+        local rel = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+        local raw = min + (max - min) * rel
+        value = math.clamp(math.floor(raw / step + 0.5) * step, min, max)
+        fill.Size = UDim2.fromScale((value - min) / (max - min), 1)
+        title.Text = label .. ": " .. tostring(value)
+        safe(callback, value)
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            setFromX(input.Position.X)
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    maid:Give(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(input.Position.X)
+        end
+    end))
+end
+
+local function addTextBox(page, label, placeholder, callback)
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 58),
+        BackgroundColor3 = THEME.Panel,
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, { corner(8) })
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 20),
+        Position = UDim2.fromOffset(10, 4),
+        BackgroundTransparency = 1,
+        Text = label,
+        TextColor3 = THEME.Text,
+        TextSize = 12,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+
+    local box = create("TextBox", {
+        Size = UDim2.new(1, -20, 0, 26),
+        Position = UDim2.fromOffset(10, 26),
+        BackgroundColor3 = THEME.Bg,
+        PlaceholderText = placeholder,
+        PlaceholderColor3 = THEME.SubText,
+        Text = "",
+        TextColor3 = THEME.Text,
+        TextSize = 12,
+        Font = Enum.Font.Code,
+        ClearTextOnFocus = false,
+        Parent = row,
+    }, { corner(6), create("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+
+    box.FocusLost:Connect(function()
+        safe(callback, box.Text)
+    end)
+end
+
+---------------------------------------------------------------------
+-- UI :: pages
+---------------------------------------------------------------------
+-- FARM
+do
+    local page = pages.Farm
+    addSection(page, "Combat")
+    addToggle(page, "Auto Farm", false, function(v)
+        State.AutoFarm = v
+        if v then
+            Mover.Hold()
+            Notify("Auto Farm enabled", 2)
+        else
+            Mover.CancelTween()
+            if not State.AutoFruit then Mover.Release() end
+            State.Status = "Idle"
+            Notify("Auto Farm disabled", 2)
+        end
+    end)
+    addToggle(page, "Safety Retreat", true, function(v)
+        State.Safety = v
+        if not v then
+            State.Retreating = false
+            retreatAnchor = nil
+        end
+    end)
+    addCycle(page, "Weapon: ", CONFIG.WeaponTypes,
+        function() return CONFIG.WeaponIndex end,
+        function(i) CONFIG.WeaponIndex = i end)
+    addTextBox(page, "Mob filter (comma separated)", "e.g. bandit, monkey", function(text)
+        local list = {}
+        for piece in string.gmatch(text, "[^,]+") do
+            local t = trim(piece)
+            if t ~= "" then table.insert(list, t) end
+        end
+        CONFIG.EnemyNameFilter = list
+        Notify(#list == 0 and "Mob filter cleared" or ("Filter: " .. table.concat(list, ", ")), 2.5)
+    end)
+
+    addSection(page, "Tuning")
+    addSlider(page, "Hover height", 4, 40, CONFIG.FarmHeight, 1, function(v) CONFIG.FarmHeight = v end)
+    addSlider(page, "Travel speed", 80, 400, CONFIG.TweenSpeed, 10, function(v) CONFIG.TweenSpeed = v end)
+    addSlider(page, "Attack delay (ms)", 40, 400, math.floor(CONFIG.AttackInterval * 1000), 10, function(v)
+        CONFIG.AttackInterval = v / 1000
+    end)
+    addSlider(page, "Retreat at HP %", 10, 70, math.floor(CONFIG.SafetyLow * 100), 5, function(v)
+        CONFIG.SafetyLow = v / 100
+    end)
+end
+
+-- MISC
+do
+    local page = pages.Misc
+    addSection(page, "Fruits")
+    addToggle(page, "Collect Fruits", false, function(v)
+        State.AutoFruit = v
+        if not v and not State.AutoFarm then
+            Mover.CancelTween()
+            Mover.Release()
+        end
+    end)
+    addToggle(page, "Fruit ESP", false, function(v) State.FruitESP = v end)
+
+    addSection(page, "Performance")
+    addToggle(page, "Low-Lag Mode", false, function(v)
+        State.LowLag = v
+        if v then LowLag.Enable() else LowLag.Disable() end
+        Notify(v and "Low-Lag Mode on" or "Low-Lag Mode off", 2)
+    end)
+
+    addSection(page, "Team")
+    addButton(page, "Join Pirates", function() Remotes.SetTeam("Pirates") end)
+    addButton(page, "Join Marines", function() Remotes.SetTeam("Marines") end)
+end
+
+-- STATS
+do
+    local page = pages.Stats
+    addSection(page, "Auto Stats")
+    addToggle(page, "Auto Add Points", false, function(v)
+        State.AutoStats = v
+        Notify(v and ("Auto stats: " .. CONFIG.StatNames[CONFIG.StatIndex]) or "Auto stats off", 2)
+    end)
+    addCycle(page, "Stat: ", CONFIG.StatNames,
+        function() return CONFIG.StatIndex end,
+        function(i) CONFIG.StatIndex = i end)
+    addSlider(page, "Points per tick", 1, 10, CONFIG.StatPointsPer, 1, function(v)
+        CONFIG.StatPointsPer = v
+    end)
+end
+
+-- INFO
+local statsLabel
+do
+    local page = pages.Info
+    addSection(page, "Live status")
+    statsLabel = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 120),
+        BackgroundColor3 = THEME.Panel,
+        TextColor3 = THEME.SubText,
+        TextSize = 12,
+        Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        Text = "",
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, {
+        corner(8),
+        create("UIPadding", {
+            PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 8),
+            PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+        }),
+    })
+
+    addSection(page, "About")
+    create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 74),
+        BackgroundColor3 = THEME.Panel,
+        TextColor3 = THEME.SubText,
+        TextSize = 12,
+        Font = Enum.Font.Gotham,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        Text = BRAND.Name .. " v" .. BRAND.Version .. "\nMade " .. BRAND.Credit
+            .. "\nRightControl hides / shows the window.",
+        LayoutOrder = nextOrder(),
+        Parent = page,
+    }, {
+        corner(8),
+        create("UIPadding", {
+            PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 8),
+            PaddingRight = UDim.new(0, 8),
+        }),
+    })
+end
+
+task.spawn(function()
+    while alive do
+        local target = (State.Target and State.Target.Parent) and State.Target.Name or "none"
+        statsLabel.Text = table.concat({
+            "Status : " .. State.Status,
+            "Target : " .. target,
+            "Kills  : " .. State.Kills,
+            "Fruits : " .. State.FruitsGot,
+            "HP     : " .. string.format("%d%%", healthFraction() * 100),
+            "World  : " .. SeaLabel,
+            "Uptime : " .. formatTime(os.clock() - State.Started),
+        }, "\n")
+        perfLabel.Text = string.format("%d FPS | %d ms", State.FPS, State.Ping)
+        task.wait(0.5)
+    end
+end)
+
+---------------------------------------------------------------------
+-- UI :: drag, minimize logo, hotkey
+---------------------------------------------------------------------
+do
+    local dragging, dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    maid:Give(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+
+local logo = create("TextButton", {
+    Name = "Logo",
+    Size = UDim2.fromOffset(46, 46),
+    Position = UDim2.new(0, 16, 0.5, -23),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    Text = "P",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 24,
+    Font = Enum.Font.GothamBlack,
+    Visible = false,
+    Parent = screenGui,
+}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }), gradient(45) })
+
+local function setWindowVisible(visible)
+    main.Visible = visible
+    logo.Visible = not visible
+end
+
+minimizeBtn.MouseButton1Click:Connect(function() setWindowVisible(false) end)
+logo.MouseButton1Click:Connect(function() setWindowVisible(true) end)
+
+maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == CONFIG.HideKey then
+        setWindowVisible(not main.Visible)
+    end
+end))
+
+---------------------------------------------------------------------
+-- Lifecycle
+---------------------------------------------------------------------
+local function destroy()
+    alive = false
+    State.AutoFarm, State.AutoFruit, State.FruitESP, State.AutoStats = false, false, false, false
+    State.LowLag = false
+    LowLag.Disable()
+    clearESP()
+    Mover.CancelTween()
+    Mover.Release()
+    maid:Clean()
+    env.PROCYSIS_BF = nil
+end
+
+closeBtn.MouseButton1Click:Connect(destroy)
+
+env.PROCYSIS_BF = {
+    Destroy = destroy,
+    State   = State,
+    Config  = CONFIG,
+    Brand   = BRAND,
+}
+
+task.spawn(farmLoop)
+task.spawn(fruitLoop)
+task.spawn(espLoop)
+task.spawn(statsLoop)
+
+---------------------------------------------------------------------
+-- Splash screen -> reveal window
+---------------------------------------------------------------------
+selectTab("Farm")
+
+do
+    local splash = create("Frame", {
+        Size = UDim2.fromOffset(300, 110),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        BackgroundColor3 = THEME.Bg,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 100,
+        Parent = screenGui,
+    }, {
+        corner(14),
+        create("UIStroke", { Color = THEME.AccentA, Thickness = 1.5, Transparency = 1 }),
+    })
+
+    local title = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 44),
+        Position = UDim2.fromOffset(0, 18),
+        BackgroundTransparency = 1,
+        Text = BRAND.Credit,
+        TextColor3 = Color3.new(1, 1, 1),
+        TextSize = 32,
+        Font = Enum.Font.GothamBlack,
+        TextTransparency = 1,
+        ZIndex = 101,
+        Parent = splash,
+    }, { gradient(0) })
+
+    local sub = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 20),
+        Position = UDim2.fromOffset(0, 68),
+        BackgroundTransparency = 1,
+        Text = "Blox Fruits Hub  |  " .. SeaLabel,
+        TextColor3 = THEME.SubText,
+        TextSize = 13,
+        Font = Enum.Font.GothamMedium,
+        TextTransparency = 1,
+        ZIndex = 101,
+        Parent = splash,
+    })
+
+    local stroke = splash:FindFirstChildOfClass("UIStroke")
+    local fadeIn = TweenInfo.new(0.5, Enum.EasingStyle.Quad)
+    TweenService:Create(splash, fadeIn, { BackgroundTransparency = 0 }):Play()
+    TweenService:Create(title, fadeIn, { TextTransparency = 0 }):Play()
+    TweenService:Create(sub, fadeIn, { TextTransparency = 0 }):Play()
+    TweenService:Create(stroke, fadeIn, { Transparency = 0.2 }):Play()
+
+    task.delay(1.9, function()
+        if not alive then return end
+        local fadeOut = TweenInfo.new(0.45, Enum.EasingStyle.Quad)
+        TweenService:Create(splash, fadeOut, { BackgroundTransparency = 1 }):Play()
+        TweenService:Create(title, fadeOut, { TextTransparency = 1 }):Play()
+        TweenService:Create(sub, fadeOut, { TextTransparency = 1 }):Play()
+        TweenService:Create(stroke, fadeOut, { Transparency = 1 }):Play()
+        task.wait(0.5)
+        splash:Destroy()
+        if not alive then return end
+        setWindowVisible(true)
+        Notify("Welcome to " .. BRAND.Name .. "  |  " .. BRAND.Credit, 3.5)
+        if not Sea then
+            Notify("Not a Blox Fruits place, some features may not work", 5)
+        end
+    end)
+end
+
+print(("[PROCYSIS] %s v%s loaded (%s)."):format(BRAND.Name, BRAND.Version, SeaLabel))

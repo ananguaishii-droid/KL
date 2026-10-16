@@ -1,0 +1,1119 @@
+--[[
+    BLOX FRUITS ULTIMATE — ALL SEAS FRAMEWORK
+    Phase 1: Core Architecture + Data + UI Skeleton + Diagnostics
+    Environment: Roblox Studio (Luau strict)
+    No live-game remotes. No invented APIs. No anti-cheat bypass.
+]]
+
+--!strict
+--!native
+--!optimize 2
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- 0. TYPE DEFINITIONS
+--------------------------------------------------------------------------------
+
+export type SeaId = "Sea1" | "Sea2" | "Sea3" | "Unknown"
+export type ProgressState = "Unknown" | "InProgress" | "Completed" | "Unsupported"
+export type ModuleState = "Unloaded" | "Loading" | "Active" | "Paused" | "Failed" | "Disabled"
+
+export type Objective = {
+	Id: string,
+	Sea: SeaId,
+	Title: string,
+	Description: string,
+	State: ProgressState,
+	Progress: number,          -- 0-1
+	RequiredLevel: number?,
+	LastUpdated: number,
+	Source: "UserInput" | "StudioSim" | "Unsupported",
+	Notes: string?,
+}
+
+export type PlayerSnapshot = {
+	UserId: number,
+	DisplayName: string,
+	CurrentSea: SeaId,
+	Level: number,
+	Exp: number,
+	Money: number?,
+	Fragments: number?,
+	ActiveObjectives: {Objective},
+	CompletedObjectives: {string},
+	InventorySnapshot: {[string]: number},
+	LastUpdate: number,
+	SourceTrust: "Low" | "Medium" | "High",
+}
+
+export type ModuleInfo = {
+	Name: string,
+	State: ModuleState,
+	LastError: string?,
+	Enabled: boolean,
+	Priority: number,
+	Dependencies: {string},
+}
+
+export type FrameworkConfig = {
+	Theme: "Dark" | "Darker",
+	UIScale: number,
+	AutoSaveInterval: number,
+	MaxLogEntries: number,
+	EnableDiagnostics: boolean,
+	StrictMode: boolean,
+}
+
+--------------------------------------------------------------------------------
+-- 1. SIGNAL SYSTEM (lightweight, no external deps)
+--------------------------------------------------------------------------------
+
+local Signal = {}
+Signal.__index = Signal
+
+function Signal.new()
+	local self = setmetatable({
+		_bindings = {} :: {[number]: (...any) -> ()},
+		_nextId = 0,
+	}, Signal)
+	return self
+end
+
+function Signal:Connect(fn: (...any) -> ())
+	self._nextId += 1
+	local id = self._nextId
+	self._bindings[id] = fn
+	return {
+		Disconnect = function()
+			self._bindings[id] = nil
+		end,
+	}
+end
+
+function Signal:Fire(...: any)
+	for _, fn in self._bindings do
+		task.spawn(fn, ...)
+	end
+end
+
+function Signal:Destroy()
+	table.clear(self._bindings)
+end
+
+--------------------------------------------------------------------------------
+-- 2. DIAGNOSTICS CONTROLLER
+--------------------------------------------------------------------------------
+
+local DiagnosticsController = {}
+DiagnosticsController.__index = DiagnosticsController
+
+function DiagnosticsController.new(maxEntries: number)
+	local self = setmetatable({
+		_logs = {} :: {{timestamp: number, level: string, source: string, message: string}},
+		_maxEntries = maxEntries or 200,
+		_onLog = Signal.new(),
+		_errorCount = 0,
+		_warningCount = 0,
+	}, DiagnosticsController)
+	return self
+end
+
+function DiagnosticsController:Log(level: "INFO" | "WARN" | "ERROR" | "DEBUG", source: string, message: string)
+	local entry = {
+		timestamp = os.clock(),
+		level = level,
+		source = source,
+		message = message,
+	}
+	table.insert(self._logs, 1, entry)
+	if #self._logs > self._maxEntries then
+		table.remove(self._logs)
+	end
+	if level == "ERROR" then
+		self._errorCount += 1
+	elseif level == "WARN" then
+		self._warningCount += 1
+	end
+	self._onLog:Fire(entry)
+end
+
+function DiagnosticsController:GetLogs(filterLevel: string?): {{timestamp: number, level: string, source: string, message: string}}
+	if not filterLevel then
+		return table.clone(self._logs)
+	end
+	local filtered = {}
+	for _, log in self._logs do
+		if log.level == filterLevel then
+			table.insert(filtered, log)
+		end
+	end
+	return filtered
+end
+
+function DiagnosticsController:Clear()
+	table.clear(self._logs)
+	self._errorCount = 0
+	self._warningCount = 0
+end
+
+function DiagnosticsController:GetStats()
+	return {
+		Total = #self._logs,
+		Errors = self._errorCount,
+		Warnings = self._warningCount,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- 3. SETTINGS CONTROLLER
+--------------------------------------------------------------------------------
+
+local SettingsController = {}
+SettingsController.__index = SettingsController
+
+function SettingsController.new(defaults: FrameworkConfig)
+	local self = setmetatable({
+		_config = table.clone(defaults),
+		_onChanged = Signal.new(),
+		_storageKey = "BFU_Framework_Settings_v1",
+	}, SettingsController)
+	self:_load()
+	return self
+end
+
+function SettingsController:_load()
+	-- Studio-only safe storage via plugin or Attribute fallback
+	-- In pure Studio scripts we use a ModuleScript store or Attribute on a folder
+	local store = ReplicatedStorage:FindFirstChild("BFU_SettingsStore")
+	if store and store:IsA("ModuleScript") then
+		local ok, data = pcall(require, store)
+		if ok and typeof(data) == "table" then
+			for k, v in data do
+				if self._config[k] ~= nil then
+					self._config[k] = v
+				end
+			end
+		end
+	end
+end
+
+function SettingsController:Get(): FrameworkConfig
+	return table.clone(self._config)
+end
+
+function SettingsController:Set(key: string, value: any)
+	if self._config[key] == nil then
+		return false, "Unknown setting key"
+	end
+	self._config[key] = value
+	self._onChanged:Fire(key, value)
+	return true
+end
+
+function SettingsController:Reset()
+	self._config = {
+		Theme = "Dark",
+		UIScale = 1,
+		AutoSaveInterval = 30,
+		MaxLogEntries = 200,
+		EnableDiagnostics = true,
+		StrictMode = true,
+	}
+	self._onChanged:Fire("RESET", nil)
+end
+
+--------------------------------------------------------------------------------
+-- 4. PLAYER DATA CONTROLLER
+--------------------------------------------------------------------------------
+
+local PlayerDataController = {}
+PlayerDataController.__index = PlayerDataController
+
+function PlayerDataController.new(diagnostics: typeof(DiagnosticsController.new(200)))
+	local self = setmetatable({
+		_snapshot = nil :: PlayerSnapshot?,
+		_onUpdated = Signal.new(),
+		_diagnostics = diagnostics,
+		_lastManualUpdate = 0,
+	}, PlayerDataController)
+	return self
+end
+
+function PlayerDataController:CreateEmptySnapshot(): PlayerSnapshot
+	return {
+		UserId = LocalPlayer.UserId,
+		DisplayName = LocalPlayer.DisplayName,
+		CurrentSea = "Unknown",
+		Level = 0,
+		Exp = 0,
+		Money = nil,
+		Fragments = nil,
+		ActiveObjectives = {},
+		CompletedObjectives = {},
+		InventorySnapshot = {},
+		LastUpdate = os.clock(),
+		SourceTrust = "Low",
+	}
+end
+
+function PlayerDataController:GetSnapshot(): PlayerSnapshot
+	if not self._snapshot then
+		self._snapshot = self:CreateEmptySnapshot()
+		self._diagnostics:Log("WARN", "PlayerData", "No snapshot exists — created empty Low-trust snapshot")
+	end
+	return table.clone(self._snapshot)
+end
+
+function PlayerDataController:UpdateFromUserInput(partial: {[string]: any})
+	-- Only accept explicitly provided fields. Never invent values.
+	if not self._snapshot then
+		self._snapshot = self:CreateEmptySnapshot()
+	end
+
+	local changed = false
+	if partial.CurrentSea and (partial.CurrentSea == "Sea1" or partial.CurrentSea == "Sea2" or partial.CurrentSea == "Sea3") then
+		self._snapshot.CurrentSea = partial.CurrentSea
+		changed = true
+	end
+	if typeof(partial.Level) == "number" and partial.Level >= 0 then
+		self._snapshot.Level = math.floor(partial.Level)
+		changed = true
+	end
+	if typeof(partial.Exp) == "number" and partial.Exp >= 0 then
+		self._snapshot.Exp = math.floor(partial.Exp)
+		changed = true
+	end
+	if typeof(partial.Money) == "number" then
+		self._snapshot.Money = math.floor(partial.Money)
+		changed = true
+	end
+	if typeof(partial.Fragments) == "number" then
+		self._snapshot.Fragments = math.floor(partial.Fragments)
+		changed = true
+	end
+
+	if changed then
+		self._snapshot.LastUpdate = os.clock()
+		self._snapshot.SourceTrust = "Medium" -- User-provided
+		self._lastManualUpdate = os.clock()
+		self._onUpdated:Fire(self:GetSnapshot())
+		self._diagnostics:Log("INFO", "PlayerData", "Snapshot updated from user input")
+	end
+end
+
+function PlayerDataController:MarkUnsupported(field: string)
+	self._diagnostics:Log("WARN", "PlayerData", `Field '{field}' marked Unsupported — no authorized access path`)
+end
+
+function PlayerDataController:AddObjective(obj: Objective)
+	if not self._snapshot then
+		self._snapshot = self:CreateEmptySnapshot()
+	end
+	-- Prevent duplicates
+	for _, existing in self._snapshot.ActiveObjectives do
+		if existing.Id == obj.Id then
+			return false, "Objective already active"
+		end
+	end
+	table.insert(self._snapshot.ActiveObjectives, obj)
+	self._snapshot.LastUpdate = os.clock()
+	self._onUpdated:Fire(self:GetSnapshot())
+	return true
+end
+
+function PlayerDataController:CompleteObjective(id: string)
+	if not self._snapshot then return false end
+	for i, obj in self._snapshot.ActiveObjectives do
+		if obj.Id == id then
+			obj.State = "Completed"
+			obj.Progress = 1
+			obj.LastUpdated = os.clock()
+			table.insert(self._snapshot.CompletedObjectives, id)
+			table.remove(self._snapshot.ActiveObjectives, i)
+			self._onUpdated:Fire(self:GetSnapshot())
+			return true
+		end
+	end
+	return false
+end
+
+--------------------------------------------------------------------------------
+-- 5. MODULE REGISTRY (MainController core)
+--------------------------------------------------------------------------------
+
+local ModuleRegistry = {}
+ModuleRegistry.__index = ModuleRegistry
+
+function ModuleRegistry.new(diagnostics: typeof(DiagnosticsController.new(200)))
+	local self = setmetatable({
+		_modules = {} :: {[string]: ModuleInfo},
+		_instances = {} :: {[string]: any},
+		_diagnostics = diagnostics,
+		_onStateChanged = Signal.new(),
+	}, ModuleRegistry)
+	return self
+end
+
+function ModuleRegistry:Register(name: string, priority: number, dependencies: {string}?)
+	if self._modules[name] then
+		self._diagnostics:Log("WARN", "Registry", `Module {name} already registered`)
+		return false
+	end
+	self._modules[name] = {
+		Name = name,
+		State = "Unloaded",
+		LastError = nil,
+		Enabled = true,
+		Priority = priority,
+		Dependencies = dependencies or {},
+	}
+	return true
+end
+
+function ModuleRegistry:SetInstance(name: string, instance: any)
+	self._instances[name] = instance
+end
+
+function ModuleRegistry:Get(name: string): any?
+	return self._instances[name]
+end
+
+function ModuleRegistry:SetState(name: string, state: ModuleState, errorMsg: string?)
+	local mod = self._modules[name]
+	if not mod then return end
+	mod.State = state
+	mod.LastError = errorMsg
+	self._onStateChanged:Fire(name, state, errorMsg)
+	if state == "Failed" then
+		self._diagnostics:Log("ERROR", name, errorMsg or "Unknown failure")
+	end
+end
+
+function ModuleRegistry:GetAll(): {ModuleInfo}
+	local list = {}
+	for _, mod in self._modules do
+		table.insert(list, table.clone(mod))
+	end
+	table.sort(list, function(a, b) return a.Priority < b.Priority end)
+	return list
+end
+
+function ModuleRegistry:Enable(name: string, enabled: boolean)
+	local mod = self._modules[name]
+	if mod then
+		mod.Enabled = enabled
+		if not enabled then
+			self:SetState(name, "Disabled")
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 6. UI CONTROLLER — Modern Dark Theme, Resizable, Tabbed
+--------------------------------------------------------------------------------
+
+local UIController = {}
+UIController.__index = UIController
+
+local THEME = {
+	Background = Color3.fromRGB(18, 18, 22),
+	Surface = Color3.fromRGB(28, 28, 34),
+	SurfaceHover = Color3.fromRGB(38, 38, 46),
+	Border = Color3.fromRGB(55, 55, 65),
+	Primary = Color3.fromRGB(99, 102, 241),
+	PrimaryHover = Color3.fromRGB(129, 140, 248),
+	Text = Color3.fromRGB(240, 240, 245),
+	TextDim = Color3.fromRGB(160, 160, 175),
+	Success = Color3.fromRGB(34, 197, 94),
+	Warning = Color3.fromRGB(234, 179, 8),
+	Error = Color3.fromRGB(239, 68, 68),
+	Accent = Color3.fromRGB(56, 189, 248),
+}
+
+function UIController.new(
+	playerData: typeof(PlayerDataController.new(DiagnosticsController.new(200))),
+	registry: typeof(ModuleRegistry.new(DiagnosticsController.new(200))),
+	diagnostics: typeof(DiagnosticsController.new(200)),
+	settings: typeof(SettingsController.new({} :: any))
+)
+	local self = setmetatable({
+		_playerData = playerData,
+		_registry = registry,
+		_diagnostics = diagnostics,
+		_settings = settings,
+		_screenGui = nil :: ScreenGui?,
+		_mainFrame = nil :: Frame?,
+		_tabContents = {} :: {[string]: Frame},
+		_currentTab = "Overview",
+		_isMinimized = false,
+		_dragConnection = nil :: RBXScriptConnection?,
+		_resizeConnection = nil :: RBXScriptConnection?,
+		_connections = {} :: {RBXScriptConnection},
+	}, UIController)
+	return self
+end
+
+function UIController:_createCorner(parent: GuiObject, radius: number?)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 8)
+	c.Parent = parent
+	return c
+end
+
+function UIController:_createStroke(parent: GuiObject, color: Color3?, thickness: number?)
+	local s = Instance.new("UIStroke")
+	s.Color = color or THEME.Border
+	s.Thickness = thickness or 1
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	return s
+end
+
+function UIController:_createPadding(parent: GuiObject, px: number)
+	local p = Instance.new("UIPadding")
+	p.PaddingTop = UDim.new(0, px)
+	p.PaddingBottom = UDim.new(0, px)
+	p.PaddingLeft = UDim.new(0, px)
+	p.PaddingRight = UDim.new(0, px)
+	p.Parent = parent
+	return p
+end
+
+function UIController:Initialize()
+	if self._screenGui then return end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "BFU_AllSeasFramework"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 100
+	gui.Parent = PlayerGui
+	self._screenGui = gui
+
+	-- Main Window
+	local main = Instance.new("Frame")
+	main.Name = "MainWindow"
+	main.Size = UDim2.fromOffset(720, 520)
+	main.Position = UDim2.fromScale(0.5, 0.5)
+	main.AnchorPoint = Vector2.new(0.5, 0.5)
+	main.BackgroundColor3 = THEME.Background
+	main.BorderSizePixel = 0
+	main.ClipsDescendants = true
+	main.Parent = gui
+	self._mainFrame = main
+	self:_createCorner(main, 12)
+	self:_createStroke(main, THEME.Border, 1)
+
+	-- Title Bar
+	local titleBar = Instance.new("Frame")
+	titleBar.Name = "TitleBar"
+	titleBar.Size = UDim2.new(1, 0, 0, 40)
+	titleBar.BackgroundColor3 = THEME.Surface
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = main
+	self:_createCorner(titleBar, 12)
+
+	-- Fix corner bleed
+	local titleFix = Instance.new("Frame")
+	titleFix.Size = UDim2.new(1, 0, 0, 12)
+	titleFix.Position = UDim2.new(0, 0, 1, -12)
+	titleFix.BackgroundColor3 = THEME.Surface
+	titleFix.BorderSizePixel = 0
+	titleFix.Parent = titleBar
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Name = "Title"
+	titleLabel.Size = UDim2.new(1, -120, 1, 0)
+	titleLabel.Position = UDim2.fromOffset(16, 0)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.TextSize = 15
+	titleLabel.TextColor3 = THEME.Text
+	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	titleLabel.Text = "BFU • All Seas Framework"
+	titleLabel.Parent = titleBar
+
+	-- Window controls
+	local function makeControlBtn(name: string, text: string, xOffset: number, color: Color3)
+		local btn = Instance.new("TextButton")
+		btn.Name = name
+		btn.Size = UDim2.fromOffset(32, 28)
+		btn.Position = UDim2.new(1, xOffset, 0.5, 0)
+		btn.AnchorPoint = Vector2.new(1, 0.5)
+		btn.BackgroundColor3 = THEME.SurfaceHover
+		btn.BorderSizePixel = 0
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 14
+		btn.TextColor3 = color
+		btn.Text = text
+		btn.AutoButtonColor = false
+		btn.Parent = titleBar
+		self:_createCorner(btn, 6)
+		return btn
+	end
+
+	local minBtn = makeControlBtn("Minimize", "–", -44, THEME.TextDim)
+	local closeBtn = makeControlBtn("Close", "×", -8, THEME.Error)
+
+	minBtn.MouseButton1Click:Connect(function()
+		self:ToggleMinimize()
+	end)
+	closeBtn.MouseButton1Click:Connect(function()
+		self:SetVisible(false)
+	end)
+
+	-- Dragging
+	local dragging = false
+	local dragStart: Vector2
+	local startPos: UDim2
+
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+
+	titleBar.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	table.insert(self._connections, UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end))
+
+	-- Tab Bar
+	local tabBar = Instance.new("Frame")
+	tabBar.Name = "TabBar"
+	tabBar.Size = UDim2.new(1, 0, 0, 36)
+	tabBar.Position = UDim2.fromOffset(0, 40)
+	tabBar.BackgroundColor3 = THEME.Surface
+	tabBar.BorderSizePixel = 0
+	tabBar.Parent = main
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.FillDirection = Enum.FillDirection.Horizontal
+	tabLayout.Padding = UDim.new(0, 4)
+	tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	tabLayout.Parent = tabBar
+
+	self:_createPadding(tabBar, 6)
+
+	local tabs = {"Overview", "Seas", "Quests", "Modules", "Logs", "Settings"}
+	for _, tabName in tabs do
+		local tabBtn = Instance.new("TextButton")
+		tabBtn.Name = tabName
+		tabBtn.Size = UDim2.fromOffset(90, 26)
+		tabBtn.BackgroundColor3 = THEME.Background
+		tabBtn.BorderSizePixel = 0
+		tabBtn.Font = Enum.Font.GothamMedium
+		tabBtn.TextSize = 12
+		tabBtn.TextColor3 = THEME.TextDim
+		tabBtn.Text = tabName
+		tabBtn.AutoButtonColor = false
+		tabBtn.Parent = tabBar
+		self:_createCorner(tabBtn, 6)
+
+		tabBtn.MouseButton1Click:Connect(function()
+			self:SwitchTab(tabName)
+		end)
+	end
+
+	-- Content Area
+	local content = Instance.new("Frame")
+	content.Name = "Content"
+	content.Size = UDim2.new(1, -16, 1, -92)
+	content.Position = UDim2.fromOffset(8, 84)
+	content.BackgroundTransparency = 1
+	content.ClipsDescendants = true
+	content.Parent = main
+
+	-- Create tab pages
+	for _, tabName in tabs do
+		local page = Instance.new("ScrollingFrame")
+		page.Name = tabName .. "Page"
+		page.Size = UDim2.fromScale(1, 1)
+		page.BackgroundTransparency = 1
+		page.BorderSizePixel = 0
+		page.ScrollBarThickness = 4
+		page.ScrollBarImageColor3 = THEME.Border
+		page.CanvasSize = UDim2.fromOffset(0, 0)
+		page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		page.Visible = tabName == "Overview"
+		page.Parent = content
+		self._tabContents[tabName] = page
+
+		local layout = Instance.new("UIListLayout")
+		layout.Padding = UDim.new(0, 10)
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Parent = page
+	end
+
+	-- Status Bar
+	local statusBar = Instance.new("Frame")
+	statusBar.Name = "StatusBar"
+	statusBar.Size = UDim2.new(1, 0, 0, 24)
+	statusBar.Position = UDim2.new(0, 0, 1, -24)
+	statusBar.BackgroundColor3 = THEME.Surface
+	statusBar.BorderSizePixel = 0
+	statusBar.Parent = main
+
+	local statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "StatusText"
+	statusLabel.Size = UDim2.new(1, -16, 1, 0)
+	statusLabel.Position = UDim2.fromOffset(8, 0)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Font = Enum.Font.Gotham
+	statusLabel.TextSize = 11
+	statusLabel.TextColor3 = THEME.TextDim
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.Text = "Ready • Phase 1 Core Loaded"
+	statusLabel.Parent = statusBar
+
+	self:SwitchTab("Overview")
+	self:_buildOverview()
+	self:_buildModulesTab()
+	self:_buildLogsTab()
+	self:_buildSettingsTab()
+	self:_buildSeasTab()
+	self:_buildQuestsTab()
+
+	self._diagnostics:Log("INFO", "UI", "UI Controller initialized")
+end
+
+function UIController:SwitchTab(tabName: string)
+	for name, page in self._tabContents do
+		page.Visible = name == tabName
+	end
+	self._currentTab = tabName
+
+	-- Update tab button visuals
+	local tabBar = self._mainFrame and self._mainFrame:FindFirstChild("TabBar")
+	if tabBar then
+		for _, child in tabBar:GetChildren() do
+			if child:IsA("TextButton") then
+				if child.Name == tabName then
+					child.BackgroundColor3 = THEME.Primary
+					child.TextColor3 = THEME.Text
+				else
+					child.BackgroundColor3 = THEME.Background
+					child.TextColor3 = THEME.TextDim
+				end
+			end
+		end
+	end
+end
+
+function UIController:ToggleMinimize()
+	if not self._mainFrame then return end
+	self._isMinimized = not self._isMinimized
+	if self._isMinimized then
+		self._mainFrame.Size = UDim2.fromOffset(720, 40)
+	else
+		self._mainFrame.Size = UDim2.fromOffset(720, 520)
+	end
+end
+
+function UIController:SetVisible(visible: boolean)
+	if self._screenGui then
+		self._screenGui.Enabled = visible
+	end
+end
+
+function UIController:_makeCard(parent: Instance, title: string, height: number?): Frame
+	local card = Instance.new("Frame")
+	card.Size = UDim2.new(1, 0, 0, height or 80)
+	card.BackgroundColor3 = THEME.Surface
+	card.BorderSizePixel = 0
+	card.Parent = parent
+	self:_createCorner(card, 8)
+	self:_createStroke(card)
+
+	local header = Instance.new("TextLabel")
+	header.Size = UDim2.new(1, -16, 0, 24)
+	header.Position = UDim2.fromOffset(12, 8)
+	header.BackgroundTransparency = 1
+	header.Font = Enum.Font.GothamBold
+	header.TextSize = 13
+	header.TextColor3 = THEME.Text
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.Text = title
+	header.Parent = card
+
+	return card
+end
+
+function UIController:_buildOverview()
+	local page = self._tabContents["Overview"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 10)
+	layout.Parent = page
+
+	local snap = self._playerData:GetSnapshot()
+
+	local card = self:_makeCard(page, "Player Snapshot", 140)
+	local info = Instance.new("TextLabel")
+	info.Size = UDim2.new(1, -24, 1, -40)
+	info.Position = UDim2.fromOffset(12, 36)
+	info.BackgroundTransparency = 1
+	info.Font = Enum.Font.Gotham
+	info.TextSize = 13
+	info.TextColor3 = THEME.TextDim
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.TextYAlignment = Enum.TextYAlignment.Top
+	info.Text = string.format(
+		"User: %s\nSea: %s\nLevel: %d  |  EXP: %d\nMoney: %s  |  Fragments: %s\nTrust: %s  |  Last Update: %.1fs ago",
+		snap.DisplayName,
+		snap.CurrentSea,
+		snap.Level,
+		snap.Exp,
+		snap.Money and tostring(snap.Money) or "Unknown",
+		snap.Fragments and tostring(snap.Fragments) or "Unknown",
+		snap.SourceTrust,
+		os.clock() - snap.LastUpdate
+	)
+	info.Parent = card
+
+	local scopeCard = self:_makeCard(page, "Function Scope (Phase 1)", 180)
+	local scopeText = Instance.new("TextLabel")
+	scopeText.Size = UDim2.new(1, -24, 1, -40)
+	scopeText.Position = UDim2.fromOffset(12, 36)
+	scopeText.BackgroundTransparency = 1
+	scopeText.Font = Enum.Font.Gotham
+	scopeText.TextSize = 12
+	scopeText.TextColor3 = THEME.TextDim
+	scopeText.TextXAlignment = Enum.TextXAlignment.Left
+	scopeText.TextYAlignment = Enum.TextYAlignment.Top
+	scopeText.TextWrapped = true
+	scopeText.Text = [[Implemented: UI, Module Registry, Diagnostics, Settings, Player Snapshot (user-input only)
+Requires Roblox Studio: All UI + module loading
+Requires authorized server integration: Live game data (level, quests, inventory) — currently Unsupported
+Requires user confirmation: Manual progress entry
+Unsupported: Any live-game RemoteEvent/RemoteFunction, auto-farm, teleport, fruit change, anti-cheat bypass]]
+	scopeText.Parent = scopeCard
+end
+
+function UIController:_buildModulesTab()
+	local page = self._tabContents["Modules"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = page
+
+	for _, mod in self._registry:GetAll() do
+		local card = self:_makeCard(page, mod.Name, 64)
+		local stateLabel = Instance.new("TextLabel")
+		stateLabel.Size = UDim2.new(0.4, 0, 0, 20)
+		stateLabel.Position = UDim2.fromOffset(12, 34)
+		stateLabel.BackgroundTransparency = 1
+		stateLabel.Font = Enum.Font.Gotham
+		stateLabel.TextSize = 12
+		stateLabel.TextXAlignment = Enum.TextXAlignment.Left
+		stateLabel.Text = "State: " .. mod.State
+		stateLabel.TextColor3 = if mod.State == "Active" then THEME.Success
+			elseif mod.State == "Failed" then THEME.Error
+			elseif mod.State == "Disabled" then THEME.TextDim
+			else THEME.Warning
+		stateLabel.Parent = card
+
+		local toggle = Instance.new("TextButton")
+		toggle.Size = UDim2.fromOffset(70, 24)
+		toggle.Position = UDim2.new(1, -82, 0.5, 0)
+		toggle.AnchorPoint = Vector2.new(0, 0.5)
+		toggle.BackgroundColor3 = mod.Enabled and THEME.Primary or THEME.SurfaceHover
+		toggle.BorderSizePixel = 0
+		toggle.Font = Enum.Font.GothamMedium
+		toggle.TextSize = 11
+		toggle.TextColor3 = THEME.Text
+		toggle.Text = mod.Enabled and "Enabled" or "Disabled"
+		toggle.Parent = card
+		self:_createCorner(toggle, 6)
+
+		toggle.MouseButton1Click:Connect(function()
+			self._registry:Enable(mod.Name, not mod.Enabled)
+			self:_buildModulesTab() -- refresh
+		end)
+	end
+end
+
+function UIController:_buildLogsTab()
+	local page = self._tabContents["Logs"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = page
+
+	for _, log in self._diagnostics:GetLogs() do
+		local row = Instance.new("TextLabel")
+		row.Size = UDim2.new(1, 0, 0, 22)
+		row.BackgroundColor3 = THEME.Surface
+		row.BorderSizePixel = 0
+		row.Font = Enum.Font.Code
+		row.TextSize = 11
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextColor3 = if log.level == "ERROR" then THEME.Error
+			elseif log.level == "WARN" then THEME.Warning
+			else THEME.TextDim
+		row.Text = string.format("[%s] %s | %s", log.level, log.source, log.message)
+		row.Parent = page
+		self:_createCorner(row, 4)
+		self:_createPadding(row, 6)
+	end
+end
+
+function UIController:_buildSettingsTab()
+	local page = self._tabContents["Settings"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 10)
+	layout.Parent = page
+
+	local cfg = self._settings:Get()
+	local card = self:_makeCard(page, "Framework Settings", 160)
+	local txt = Instance.new("TextLabel")
+	txt.Size = UDim2.new(1, -24, 1, -40)
+	txt.Position = UDim2.fromOffset(12, 36)
+	txt.BackgroundTransparency = 1
+	txt.Font = Enum.Font.Gotham
+	txt.TextSize = 13
+	txt.TextColor3 = THEME.TextDim
+	txt.TextXAlignment = Enum.TextXAlignment.Left
+	txt.TextYAlignment = Enum.TextYAlignment.Top
+	txt.Text = string.format(
+		"Theme: %s\nUI Scale: %.2f\nAuto-Save Interval: %ds\nMax Log Entries: %d\nDiagnostics: %s\nStrict Mode: %s",
+		cfg.Theme, cfg.UIScale, cfg.AutoSaveInterval, cfg.MaxLogEntries,
+		tostring(cfg.EnableDiagnostics), tostring(cfg.StrictMode)
+	)
+	txt.Parent = card
+end
+
+function UIController:_buildSeasTab()
+	local page = self._tabContents["Seas"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 10)
+	layout.Parent = page
+
+	local seas = {
+		{Id = "Sea1", Title = "First Sea", Status = "Tracking Ready (user-input)"},
+		{Id = "Sea2", Title = "Second Sea", Status = "Tracking Ready (user-input)"},
+		{Id = "Sea3", Title = "Third Sea", Status = "Tracking Ready (user-input)"},
+	}
+	for _, sea in seas do
+		local card = self:_makeCard(page, sea.Title, 70)
+		local st = Instance.new("TextLabel")
+		st.Size = UDim2.new(1, -24, 0, 20)
+		st.Position = UDim2.fromOffset(12, 36)
+		st.BackgroundTransparency = 1
+		st.Font = Enum.Font.Gotham
+		st.TextSize = 12
+		st.TextColor3 = THEME.Accent
+		st.TextXAlignment = Enum.TextXAlignment.Left
+		st.Text = sea.Status .. " • Live game data = Unsupported"
+		st.Parent = card
+	end
+end
+
+function UIController:_buildQuestsTab()
+	local page = self._tabContents["Quests"]
+	if not page then return end
+	page:ClearAllChildren()
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = page
+
+	local snap = self._playerData:GetSnapshot()
+	if #snap.ActiveObjectives == 0 then
+		local empty = self:_makeCard(page, "No Active Objectives", 60)
+		local t = Instance.new("TextLabel")
+		t.Size = UDim2.new(1, -24, 0, 20)
+		t.Position = UDim2.fromOffset(12, 32)
+		t.BackgroundTransparency = 1
+		t.Font = Enum.Font.Gotham
+		t.TextSize = 12
+		t.TextColor3 = THEME.TextDim
+		t.Text = "Add objectives manually or via future Studio simulation modules"
+		t.Parent = empty
+	else
+		for _, obj in snap.ActiveObjectives do
+			local card = self:_makeCard(page, obj.Title, 80)
+			local desc = Instance.new("TextLabel")
+			desc.Size = UDim2.new(1, -24, 0, 40)
+			desc.Position = UDim2.fromOffset(12, 32)
+			desc.BackgroundTransparency = 1
+			desc.Font = Enum.Font.Gotham
+			desc.TextSize = 12
+			desc.TextColor3 = THEME.TextDim
+			desc.TextXAlignment = Enum.TextXAlignment.Left
+			desc.TextWrapped = true
+			desc.Text = string.format("[%s] %s • %.0f%% • %s", obj.Sea, obj.State, obj.Progress * 100, obj.Source)
+			desc.Parent = card
+		end
+	end
+end
+
+function UIController:Destroy()
+	for _, conn in self._connections do
+		conn:Disconnect()
+	end
+	table.clear(self._connections)
+	if self._screenGui then
+		self._screenGui:Destroy()
+		self._screenGui = nil
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 7. MAIN CONTROLLER
+--------------------------------------------------------------------------------
+
+local MainController = {}
+MainController.__index = MainController
+
+function MainController.new()
+	local self = setmetatable({
+		_diagnostics = DiagnosticsController.new(300),
+		_settings = nil :: any,
+		_playerData = nil :: any,
+		_registry = nil :: any,
+		_ui = nil :: any,
+		_started = false,
+	}, MainController)
+
+	self._settings = SettingsController.new({
+		Theme = "Dark",
+		UIScale = 1,
+		AutoSaveInterval = 30,
+		MaxLogEntries = 300,
+		EnableDiagnostics = true,
+		StrictMode = true,
+	})
+	self._playerData = PlayerDataController.new(self._diagnostics)
+	self._registry = ModuleRegistry.new(self._diagnostics)
+
+	-- Register all planned modules (Phase 1 only loads core)
+	local planned = {
+		{"MainController", 0},
+		{"DiagnosticsController", 1},
+		{"SettingsController", 2},
+		{"PlayerDataController", 3},
+		{"UIController", 4},
+		{"QuestController", 10},
+		{"LevelProgressionController", 11},
+		{"SeaProgressionController", 12},
+		{"CombatController", 20},
+		{"WeaponController", 21},
+		{"FruitController", 22},
+		{"MasteryController", 23},
+		{"InventoryController", 24},
+		{"TravelController", 25},
+		{"BossTracker", 30},
+		{"MaterialTracker", 31},
+		{"RaidTracker", 32},
+		{"ObservationController", 33},
+		{"RaceProgressionController", 34},
+		{"AccessoryTracker", 35},
+		{"NotificationController", 40},
+	}
+	for _, entry in planned do
+		self._registry:Register(entry[1], entry[2])
+	end
+
+	return self
+end
+
+function MainController:Start()
+	if self._started then return end
+	self._started = true
+
+	self._diagnostics:Log("INFO", "Main", "Starting BFU All-Seas Framework Phase 1")
+
+	-- Mark core modules active
+	self._registry:SetState("MainController", "Active")
+	self._registry:SetState("DiagnosticsController", "Active")
+	self._registry:SetState("SettingsController", "Active")
+	self._registry:SetState("PlayerDataController", "Active")
+
+	-- UI
+	self._ui = UIController.new(self._playerData, self._registry, self._diagnostics, self._settings)
+	local ok, err = pcall(function()
+		self._ui:Initialize()
+	end)
+	if ok then
+		self._registry:SetState("UIController", "Active")
+		self._registry:SetInstance("UIController", self._ui)
+	else
+		self._registry:SetState("UIController", "Failed", tostring(err))
+	end
+
+	-- Mark remaining as Unloaded (future phases)
+	for _, mod in self._registry:GetAll() do
+		if mod.State == "Unloaded" then
+			-- leave as-is
+		end
+	end
+
+	self._diagnostics:Log("INFO", "Main", "Phase 1 core online. Live game integration = Unsupported")
+end
+
+function MainController:GetPlayerData()
+	return self._playerData
+end
+
+function MainController:GetDiagnostics()
+	return self._diagnostics
+end
+
+function MainController:GetRegistry()
+	return self._registry
+end
+
+function MainController:Stop()
+	if self._ui then
+		self._ui:Destroy()
+	end
+	self._started = false
+	self._diagnostics:Log("INFO", "Main", "Framework stopped")
+end
+
+--------------------------------------------------------------------------------
+-- 8. BOOTSTRAP
+--------------------------------------------------------------------------------
+
+local Framework = MainController.new()
+Framework:Start()
+
+-- Example: user can manually feed data (the only supported path in Phase 1)
+-- Framework:GetPlayerData():UpdateFromUserInput({
+--     CurrentSea = "Sea1",
+--     Level = 700,
+--     Exp = 1250000,
+-- })
+
+return Framework
